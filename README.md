@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This project presents the implementation and evaluation of a cost-sensitive decision tree algorithm aimed at improving minority class detection in imbalanced binary classification problems. The work was developed within the scope of the **IACEC - Introduction to Algorithms for Classification and Clustering** course.
+This project presents the implementation and evaluation of a cost-sensitive decision tree algorithm aimed at improving minority class detection in imbalanced binary classification problems. The work was developed within the scope of the **IACEC - Introdução à Aprendizagem Computacional e Extração de Conhecimento** course.
 
 Standard decision tree algorithms tend to optimize overall accuracy, often neglecting minority classes when datasets are highly imbalanced. This project addresses that limitation by introducing **cost-sensitive modifications to the CART (Classification and Regression Trees) algorithm**.
 
