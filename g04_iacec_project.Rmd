@@ -1,0 +1,1321 @@
+--- 
+title: "Project IACEC Group 04"
+output: html_document
+date: Sys.Date()
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+# Cost-Sensitive Decision Trees
+
+## Introduction
+
+Classification algorithms aim to learn patterns from data to accurately predict class labels for new instances.
+However, in many real-world problems we are presented with various issues, such as noise, high dimensionality, multiclass complexity and class imbalance.
+
+Class imbalance is a common challenge where one class (the majority class) significantly outnumbers the other class (the minority class), and that is the focus of this project.
+When class imbalance happens, the standard algorithms tend to be biased towards the majority class, leading to high overall accuracy, but failing to identify the minority class instances.
+
+We selected the Decision Tree classifier as our base algorithm for this project due to its interpretability and versatility.
+However, standard decision trees tend to maximize overall accuracy and, in general, ignoring the minority class in favor of the majority, in imbalanced datasets.
+
+Our goal is to:
+
+\- Analyze how standard decision trees behave towards minority classes in imbalanced datasets\
+- Propose and implement a modified decision tree to try and improve minority class recall\
+- Test both algorithms on a variety of real-world imbalanced datasets (from OpenML) - Compare results
+
+All this will allow us to try to make the decision tree more robust towards the minority.
+First here all all the imports that will be needed in this project:
+
+```{r, include=FALSE}
+# Imports
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(OpenML)
+library(farff)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+```
+
+These libraries will facilitate our work and make it easier to implement the algorithms and evaluate them.
+
+To run this project it is mandatory to have datasets folder in the same directory as this Rmd file, like this:
+
+```         
+├── datasets/
+│   ├── 15/
+│   ├── 31/
+│   └──...
+└── g04_iacec_project.Rmd
+```
+
+In each dataset folder there needs to be at least 1 file named: dataset.arff.
+
+The datasets folder delivered includes 19 datasets.
+But, for reasons explained later only 14 of these will be selected.
+To use all the datasets it is necessary to choose a lower value for the imbalance threshold (explained in later sections)
+
+## Simple Standard version of Decision Trees in R
+
+### Simpler logic
+
+As the standard version of decision trees we used a Classification and Regression Trees (CART).
+
+CART generates a tree by iteratively partitioning the data into progressively homogeneous subgroups.
+At each node, the algorithm considers all possible splits over all predictors and selects the one that maximizes class purity.
+For classification tasks, CART utilizes the Gini impurity as its default splitting criterion.
+The tree continues to grow until stopping conditions are met, after which it may be pruned to avoid overfitting.
+
+Below is a simple implementation of this, built with the library `rpart` for initial understanding, using the well-known iris dataset:
+
+```{r}
+# Create a binary problem: Setosa vs Not-Setosa
+iris$IsSetosa <- ifelse(iris$Species == "setosa", "Yes", "No")
+iris$IsSetosa <- factor(iris$IsSetosa, levels = c("No", "Yes"))
+
+# Fit standard CART tree
+tree_model <- rpart(
+  IsSetosa ~ Sepal.Length + Sepal.Width + Petal.Length + Petal.Width,
+  data = iris,
+  method = "class"
+)
+
+# Plot the tree
+rpart.plot(tree_model, type = 3, extra = 104)
+
+# Predictions
+pred <- predict(tree_model, iris, type = "class")
+
+# Confusion matrix table
+print(table(Predicted = pred, Actual = iris$IsSetosa))
+
+# caret confusion matrix
+confusionMatrix(pred, iris$IsSetosa)
+```
+
+The results show that the CART decision tree achieved perfect results on this binary test.
+These results were expected since Setosa class is linearly and cleanly separable from the other two iris species, making this a trivial decision.
+
+Even though this results were perfect this does not reflect the real-world problems that motivate this project, since there is no substantial class imbalance or class overlap.
+To continue this project, from now on we will use datasets from OpenML with class imbalance.
+
+## Decision trees logic
+
+The previous implementation of the decision tree presented a problem since it uses the `rpart` library, which is optimized and has many built-in features that we cannot modify easily.
+So we decided to implement our own version of the decision tree from scratch, based on the CART algorithm.
+
+### Pre process all the data
+
+As mentioned before we will use OpenML datasets for this project.
+These we downloaded to a folder `datasets` and should each dataset be inside a folder with the name as the id of the dataset to facilitate identification.
+
+For our project, datasets with more than one class are not allowed, so we will only use binary classification datasets.
+Also we will only use datasets with a significant class imbalance (imbalance ratio \> 3).
+Some datasets might have issues, such as missing values, non-numeric features, or inconsistent label naming, and we can not continue the work with that, so those issues have to be deleted or solved.
+
+All that is done in the code bellow:
+
+```{r}
+# This function is responsible for preprocessing data -> clean and solve some issues that might encounter
+preprocess_dataset <- function(dataset, max_rows = 5000) {
+  if (is.null(dataset) || nrow(dataset) == 0) {
+    return(NULL)
+  }
+  
+  dataset <- dataset[complete.cases(dataset), ]
+  
+  if (nrow(dataset) == 0) {
+    return(NULL)
+  }
+  
+  minority_class <- unique(dataset$label)[which.min(table(dataset$label))]
+  minority_count <- sum(dataset$label == minority_class)
+  if (minority_count < 2) {
+    return(NULL)
+  }
+  
+  if (nrow(dataset) > max_rows) {
+    set.seed(123) # For reproducibility
+    minority_indices <- which(dataset$label == minority_class)
+    majority_indices <- which(dataset$label != minority_class)
+    
+    minority_keep <- min(length(minority_indices), max(20, round(max_rows * 0.3)))
+    majority_keep <- max_rows - minority_keep
+    
+    if (length(minority_indices) > 0 && length(majority_indices) > 0) {
+      sampled_minority <- sample(minority_indices, minority_keep)
+      sampled_majority <- sample(majority_indices, majority_keep)
+      dataset <- dataset[c(sampled_minority, sampled_majority), ]
+    }
+  }
+  
+  return(dataset)
+}
+
+# Dataset fix function
+fix_dataset_issues <- function(dataset) {
+  if (is.null(dataset) || nrow(dataset) == 0) return(dataset)
+  
+  dataset <- dataset[complete.cases(dataset), ]
+  
+  numeric_cols <- sapply(dataset, is.numeric)
+  if (any(numeric_cols)) {
+    dataset <- dataset[is.finite(rowSums(dataset[, numeric_cols, drop = FALSE])), ]
+  }
+
+  if ("label" %in% colnames(dataset)) {
+    dataset$label <- trimws(as.character(dataset$label))
+    dataset <- dataset[!is.na(dataset$label) & dataset$label != "", ]
+  }
+  
+  dataset <- droplevels(dataset)
+  if (nrow(dataset) < 2) return(NULL)
+  
+  return(dataset)
+}
+
+# Validate output
+validate_dataset <- function(dataset_entry) {
+  if (is.null(dataset_entry) || is.null(dataset_entry$data)) return(FALSE)
+  dataset <- dataset_entry$data
+  if (!"label" %in% colnames(dataset)) return(FALSE)
+  if (nrow(dataset) < 2) return(FALSE)
+  if (!dataset_entry$minority %in% dataset$label) return(FALSE)
+  minority_count <- sum(dataset$label == dataset_entry$minority)
+  if (minority_count < 2) return(FALSE)
+  if (any(is.na(dataset$label))) return(FALSE)
+  return(TRUE)
+}
+
+# Load all datasets
+load_all_binary_datasets <- function(base_path = "datasets", imbalance_threshold = 3) {
+  folders <- list.dirs(base_path, full.names = TRUE, recursive = FALSE)
+  
+  results <- list()
+  
+  for (folder in folders) {
+    arff_path <- file.path(folder, "dataset.arff")
+    if (!file.exists(arff_path)) next
+    
+    dataset_id <- basename(folder)
+    cat("Loading dataset:", dataset_id, "\n")
+    
+    ds <- tryCatch(readARFF(arff_path), error = function(e) NULL)
+    if (is.null(ds)) next
+    
+    ds <- as.data.frame(ds)
+    
+    # Identify label column (last column)
+    label_col <- colnames(ds)[ncol(ds)]
+    
+    # Store original labels and convert to character
+    original_labels <- as.character(ds[[label_col]])
+    unique_original_labels <- unique(original_labels)
+    
+    # Convert predictors to numeric if needed
+    predictor_cols <- 1:(ncol(ds)-1)
+    ds[predictor_cols] <- lapply(ds[predictor_cols], function(x) {
+      if (is.character(x) || is.factor(x)) {
+        num_x <- suppressWarnings(as.numeric(as.character(x)))
+        if (all(!is.na(num_x))) num_x else as.numeric(as.factor(x))
+      } else {
+        x
+      }
+    })
+    
+    # Create a clean version of the dataset with consistent label naming
+    clean_ds <- ds[predictor_cols]
+    clean_labels <- trimws(as.character(ds[[label_col]]))
+    
+    # Check if binary after cleaning
+    unique_clean_labels <- unique(clean_labels)
+    
+    if (length(unique_clean_labels) != 2) {
+      cat("   Not binary (", length(unique_clean_labels), " classes) - SKIPPED\n")
+      next
+    }
+    
+    # Convert labels to consistent 0/1 encoding for modeling
+    label_mapping <- setNames(0:1, unique_clean_labels)
+    numeric_labels <- as.character(label_mapping[clean_labels])
+    
+    # Add the numeric label to the dataset
+    clean_ds$label <- numeric_labels
+    
+    # Apply universal fixes
+    clean_ds <- fix_dataset_issues(clean_ds)
+    if (is.null(clean_ds) || nrow(clean_ds) == 0) {
+      cat("   No data after cleaning - SKIPPED\n")
+      next
+    }
+    
+    # Compute imbalance using the cleaned numeric labels
+    tab <- table(clean_ds$label)
+    if (length(tab) != 2) {
+      cat("   Not binary after cleaning - SKIPPED\n")
+      next
+    }
+    
+    maj <- max(tab)
+    mino <- min(tab)
+    imbalance <- maj / mino
+    
+    cat("   Class counts:", maj, "(majority) /", mino, "(minority) | Imbalance =", round(imbalance, 3), "\n")
+    
+    if (imbalance <= imbalance_threshold) {
+      cat("   Imbalance below threshold → SKIPPED\n")
+      next
+    }
+    
+    # Determine minority class (using the numeric label)
+    minority_class <- names(tab)[which.min(tab)]
+    majority_class <- names(tab)[which.max(tab)]
+    
+    # Map back to original labels for reporting
+    minority_original <- names(label_mapping)[label_mapping == minority_class]
+    majority_original <- names(label_mapping)[label_mapping == majority_class]
+    
+    cat("   Minority class (numeric):", minority_class, "| (original):", minority_original, "\n")
+    
+    # Verify the minority class exists in the dataset
+    if (!minority_class %in% clean_ds$label) {
+      cat("ERROR: Minority class not found in processed dataset!\n")
+      next
+    }
+    
+    # Save dataset with complete label mapping information
+    results[[dataset_id]] <- list(
+      name = dataset_id,
+      data = clean_ds,
+      minority = minority_class,
+      minority_original = minority_original,
+      majority = majority_class,
+      majority_original = majority_original,
+      label_mapping = label_mapping,
+      imbalance = imbalance,
+      n_rows = nrow(clean_ds),
+      n_features = ncol(clean_ds) - 1,
+      original_label_col = label_col
+    )
+    
+    cat("ACCEPTED!\n")
+  }
+  
+  return(results)
+}
+
+
+datasets <- load_all_binary_datasets(base_path = "datasets", imbalance_threshold = 3)
+
+if (length(datasets) == 0) {
+  stop("No datasets found that meet the criteria. Please check your dataset folder.")
+}
+
+valid_datasets <- list()
+for (ds_name in names(datasets)) {
+  dataset_entry <- datasets[[ds_name]]
+  dataset_entry$data <- fix_dataset_issues(dataset_entry$data)
+  if (validate_dataset(dataset_entry)) {
+    valid_datasets[[ds_name]] <- dataset_entry
+  }
+}
+
+datasets <- valid_datasets
+
+# Display dataset information
+dataset_info <- data.frame(
+  Dataset = names(datasets),
+  Rows = sapply(datasets, function(x) x$n_rows),
+  Features = sapply(datasets, function(x) x$n_features),
+  Imbalance = sapply(datasets, function(x) round(x$imbalance, 2)),
+  Minority_Class = sapply(datasets, function(x) x$minority),
+  Minority_Original = sapply(datasets, function(x) x$minority_original)
+)
+print(dataset_info)
+
+# Use ALL datasets for comprehensive evaluation
+selected_datasets <- names(datasets)
+
+cat("\n\nUsing", length(selected_datasets), "datasets for comprehensive evaluation\n")
+
+# Global storage for results
+standard_results <- list()
+cost_sensitive_results <- list()
+```
+
+From our base folder 14 datasets were considered good and ready for testing.
+If more datasets are added to the folder the code is also ready to test those and it might give a different number of chosen datasets.
+Also, if we change the value of imbalance_threshold more or less datasets might be chosen.
+The value 3 as imbalance threshold was chosen to have only datasets with significant imbalance.
+
+The 14 datasets that will be used are:\
+
+| ID | Description |
+|----|----|
+| 1049 | PC hardware specifications and their relative performance. |
+| 1050 | Student performance in Portuguese language classes. |
+| 1053 | Student performance in mathematics classes. |
+| 1063 | Glass types classified by their chemical composition (Glass Identification). |
+| 1067 | Predicting the presence of heart disease (Cleveland Heart Disease). |
+| 1068 | Audio characteristics to distinguish between metal and rock music. |
+| 1461 | Predicting if a bank client will subscribe to a term deposit (Bank Marketing). |
+| 1464 | Predicting if a donor will donate blood (Blood Transfusion Service Center). |
+| 1487 | Predicting days with high ozone concentration (Ozone Level Detection). |
+| 1590 | Predicting if an individual's income exceeds \$50K/year (Adult/Census Income). |
+| 310 | Classifying mammographic masses as benign or malignant. |
+| 40701 | Image dataset of Zalando's clothing articles (Fashion-MNIST). |
+| 40983 | Rating red wine quality (0-10) based on physicochemical tests. |
+| 40994 | Classifying scribes based on features from page images of the Avila Bible. |
+
+### Metrics to be Tested
+
+In imbalanced classification problems, traditional accuracy is often misleading, as a model can achieve high accuracy by simply predicting the majority class.
+We focus on metrics that specifically evaluate minority class performance:
+
+-   **Accuracy**: Proportion of correct predictions across all classes.
+
+$$
+\text{Accuracy} = \frac{TP + TN}{TP + TN + FP + FN}
+$$
+
+-   **Minority Class Recall**: Ability to correctly identify minority class instances.
+
+$$
+\text{Recall}_{\text{minority}} = \frac{TP}{TP + FN}
+$$
+
+-   **Minority Class Precision**: Proportion of correctly predicted minority instances among all predicted minority instances.
+
+$$
+\text{Precision}_{\text{minority}} = \frac{TP}{TP + FP}
+$$
+
+-   **F1-Score for Minority Class**: Harmonic mean of precision and recall, providing a balanced measure.
+
+$$
+\text{F1}_{\text{minority}} = 2 \times \frac{\text{Precision} \times \text{Recall}}{\text{Precision} + \text{Recall}}
+$$
+
+-   **Training Time**: Computational efficiency measured in seconds.
+-   **Imbalance Ratio**: Severity of class imbalance.
+
+$$
+\text{Imbalance Ratio} = \frac{N_{\text{majority}}}{N_{\text{minority}}}
+$$
+
+Where for the minority class:
+
+\- **TP** (True Positives): Minority instances correctly classified as minority\
+- **FP** (False Positives): Majority instances incorrectly classified as minority\
+- **FN** (False Negatives): Minority instances incorrectly classified as majority\
+- **TN** (True Negatives): Majority instances correctly classified as majority
+
+These metrics will allows to understand the model performance, especially of minority class detection.
+
+### Standard version code
+
+Now that we have all the data preprocessed and ready to test, we can implement the decision tree from scratch.
+This code uses recursive binary partitioning, majority voting at terminal nodes, and Gini impurity for splits to create a standard CART decision tree classifier.
+This standard version will later be used to compare against our modified cost-sensitive version.
+
+```{r}
+# Gini index code 
+# This function measures "impurity". A Gini index of 0 means the node is "pure" (all instances belong to the same class).
+# The formula used is: Gini = 1 - sum(probability_of_class_i ^ 2).
+# We calculate this for each group (left/right) and compute a weighted average based on the size of each group. We want to minimize this value.
+gini_index_standard <- function(groups, classes) {
+  n_instances <- sum(sapply(groups, nrow))
+  if (n_instances == 0) return(0)
+  
+  gini <- 0.0
+  for (group in groups) {
+    size <- nrow(group)
+    if (size == 0) next
+    
+    # Vectorized purity calculation - much faster
+    # Calculates the proportion of each class in the current group
+    class_counts <- tabulate(match(group$label, classes), nbins = length(classes))
+    proportions <- class_counts / size
+    proportions <- proportions[!is.na(proportions)]
+
+    # Calculate sum of squared probabilities
+    score <- sum(proportions * proportions)
+    
+    # Weight the Gini score by the size of this group relative to the total
+    gini <- gini + (1.0 - score) * (size / n_instances)
+  }
+  return(gini)
+}
+
+# Split function - creates binary partition
+test_split <- function(index, value, dataset) {
+  mask <- dataset[, index] < value
+  list(left = dataset[mask, , drop = FALSE], 
+       right = dataset[!mask, , drop = FALSE])
+}
+
+# This function finds the absolute best split point in the entire dataset.
+# It uses a "Greedy" approach:
+# 1. Iterate through every feature (column).
+# 2. Iterate through candidate values in that feature.
+# 3. Calculate the Gini index for that specific split.
+# 4. Keep the split with the lowest Gini score (lowest impurity).
+get_split_standard <- function(dataset) {
+  class_values <- unique(dataset$label)
+  n_features <- ncol(dataset) - 1
+  
+  best_split <- list(index = NULL, value = NULL, score = Inf, groups = NULL)
+  
+  for (index in 1:n_features) {
+    feature_vals <- dataset[, index]
+    
+    # Instead of checking every single unique value as a split point (which is slow 
+    # for continuous data), this uses quantiles (20%, 40%, etc.) if there are many unique values.
+    # This approximates the best split significantly faster.
+    if (length(unique(feature_vals)) > 10) {
+      split_candidates <- quantile(feature_vals, probs = seq(0.2, 0.8, 0.2), na.rm = TRUE)
+    } else {
+      split_candidates <- unique(feature_vals)
+    }
+    
+    split_candidates <- unique(split_candidates)
+    if (length(split_candidates) == 0) next
+    
+    for (value in split_candidates) {
+      groups <- test_split(index, value, dataset)
+      
+      # Skip invalid splits faster
+      # We don't want to create empty nodes or nodes with just 1 sample (overfitting risk)
+      if (nrow(groups$left) < 2 || nrow(groups$right) < 2) next
+      
+      gini <- gini_index_standard(groups, class_values)
+      
+      # If this split is cleaner (lower Gini) than what we found before, save it.
+      if (gini < best_split$score) {
+        best_split <- list(index = index, value = value, score = gini, groups = groups)
+      }
+    }
+  }
+  
+  if (is.null(best_split$index)) return(NULL)
+  return(list(index = best_split$index, value = best_split$value, groups = best_split$groups))
+}
+
+# Terminal node - majority class prediction
+to_terminal_standard <- function(group) {
+  if (nrow(group) == 0) return("0")
+  outcomes <- group$label
+  tab <- table(outcomes)
+  names(which.max(tab))[1]
+}
+
+# Recursive tree building with early stopping optimization
+# 
+# This uses Depth First Search logic to grow the tree.
+# It splits the data, creates a node, and then calls itself on the left and right children.
+# It stops if:
+# 1. Max depth is reached.
+# 2. Minimum node size (min_size) is reached.
+# 3. The node is already pure (cannot be split further).
+recursive_split_standard <- function(node, max_depth, min_size, depth) {
+  if (is.null(node) || depth > max_depth) return(node)
+  
+  left <- node$groups$left
+  right <- node$groups$right
+  node$groups <- NULL
+  
+  # Terminal conditions
+  if (nrow(left) == 0 || nrow(right) == 0) {
+    combined <- if (nrow(left) > 0) left else right
+    terminal_val <- to_terminal_standard(combined)
+    return(list(left = terminal_val, right = terminal_val))
+  }
+  
+  if (depth >= max_depth) {
+    node$left <- to_terminal_standard(left)
+    node$right <- to_terminal_standard(right)
+    return(node)
+  }
+  
+  # Process left child
+  if (nrow(left) <= min_size) {
+    node$left <- to_terminal_standard(left)
+  } else {
+    left_split <- get_split_standard(left)
+    node$left <- if (!is.null(left_split)) {
+      recursive_split_standard(left_split, max_depth, min_size, depth + 1)
+    } else {
+      to_terminal_standard(left)
+    }
+  }
+  
+  # Process right child
+  if (nrow(right) <= min_size) {
+    node$right <- to_terminal_standard(right)
+  } else {
+    right_split <- get_split_standard(right)
+    node$right <- if (!is.null(right_split)) {
+      recursive_split_standard(right_split, max_depth, min_size, depth + 1)
+    } else {
+      to_terminal_standard(right)
+    }
+  }
+  
+  return(node)
+}
+
+# Build standard tree with optimized parameters
+build_tree_standard <- function(train, max_depth = 6, min_size = 15) {
+  root <- get_split_standard(train)
+  if (is.null(root)) {
+    majority_class <- to_terminal_standard(train)
+    return(list(left = majority_class, right = majority_class))
+  }
+  recursive_split_standard(root, max_depth, min_size, 1)
+}
+
+# Optimized prediction function with vectorization where possible
+predict_row_standard <- function(node, row) {
+  current <- node
+  while (is.list(current) && !is.null(current$index)) {
+    if (row[current$index] < current$value) {
+      current <- current$left
+    } else {
+      current <- current$right
+    }
+  }
+  if (is.character(current)) return(current)
+  return("0")
+}
+
+predict_tree_standard <- function(tree, dataset) {
+  predictions <- character(nrow(dataset))
+  for (i in 1:nrow(dataset)) {
+    predictions[i] <- predict_row_standard(tree, dataset[i, ])
+  }
+  return(predictions)
+}
+
+# Enhanced evaluation function with performance optimizations
+evaluate_standard_tree_enhanced <- function(dataset_name, dataset, minority_class_label) {
+  cat("Evaluating Standard Tree on:", dataset_name, "\n")
+  
+  dataset <- preprocess_dataset(dataset)
+  if (is.null(dataset)) {
+    return(NULL)
+  }
+  
+  if (!"label" %in% colnames(dataset)) {
+    return(NULL)
+  }
+  
+  if (!minority_class_label %in% dataset$label) {
+    return(NULL)
+  }
+  
+  minority_count <- sum(dataset$label == minority_class_label)
+  if (minority_count < 2) {
+    return(NULL)
+  }
+  
+  counts <- table(dataset$label)
+  
+  start_time <- Sys.time()
+  tree_model <- tryCatch({
+    build_tree_standard(dataset, max_depth = 6, min_size = 15)
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (is.null(tree_model)) {
+    return(NULL)
+  }
+  
+  train_time <- as.numeric(Sys.time() - start_time)
+  
+  preds <- tryCatch({
+    predict_tree_standard(tree_model, dataset)
+  }, error = function(e) {
+    majority_class <- names(which.max(table(dataset$label)))
+    return(rep(majority_class, nrow(dataset)))
+  })
+  
+  accuracy <- mean(preds == dataset$label)
+  
+  minority_indices <- which(dataset$label == minority_class_label)
+  recall <- if (length(minority_indices) > 0) {
+    correct_minority <- sum(preds[minority_indices] == minority_class_label)
+    correct_minority / length(minority_indices)
+  } else { 0 }
+  
+  
+  predicted_minority <- which(preds == minority_class_label)
+  precision <- if (length(predicted_minority) > 0) {
+    correct_minority_pred <- sum(preds[predicted_minority] == minority_class_label)
+    correct_minority_pred / length(predicted_minority)
+  } else { 0 }
+  
+  
+  f1_score <- if (precision + recall > 0) {
+    2 * precision * recall / (precision + recall)
+  } else { 0 }
+  
+  cat("  Results - Accuracy:", round(accuracy * 100, 2), "% | ")
+  cat("Recall:", round(recall * 100, 2), "% | ")
+  cat("Precision:", round(precision * 100, 2), "% | ")
+  cat("F1:", round(f1_score * 100, 2), "%\n")
+  
+  return(list(
+    dataset = dataset_name,
+    accuracy = accuracy,
+    recall = recall,
+    precision = precision,
+    f1_score = f1_score,
+    minority_class = minority_class_label,
+    minority_count = minority_count,
+    imbalance_ratio = max(counts) / min(counts),
+    train_time = train_time
+  ))
+}
+
+# Run standard tree evaluation on ALL datasets
+cat("\nRunning Standard Decision Tree Evaluation:\n\n")
+
+for (ds_id in selected_datasets) {
+  entry <- datasets[[ds_id]]
+  dataset <- entry$data
+  minority <- entry$minority
+  
+  result <- evaluate_standard_tree_enhanced(entry$name, dataset, minority)
+  if (!is.null(result)) {
+    standard_results[[entry$name]] <- result
+  }
+}
+
+```
+
+In next section we can see the results in a easy to read table.
+
+### Results of this standard version
+
+```{r}
+create_standard_results_table <- function(results_list) {
+  results_df <- do.call(rbind, lapply(results_list, function(x) {
+    data.frame(
+      Dataset = x$dataset,
+      Accuracy = round(x$accuracy * 100, 2),
+      Recall = round(x$recall * 100, 2),
+      Precision = round(x$precision * 100, 2),
+      F1_Score = round(x$f1_score * 100, 2),
+      Minority_Class = x$minority_class,
+      Minority_Count = x$minority_count,
+      Imbalance_Ratio = round(x$imbalance_ratio, 2),
+      Train_Time = round(x$train_time, 2),
+      stringsAsFactors = FALSE
+    )
+  }))
+  return(results_df)
+}
+
+if (length(standard_results) > 0) {
+  standard_table <- create_standard_results_table(standard_results)
+  print(standard_table)
+} else {
+  cat("No standard tree results available.\n")
+}
+```
+
+This table allow us to make some conclusions regarding the standard version of the decision tree.
+We can see that the accuracy has generally high values, but the recall for the minority class is in general very low, indicating that the standard decision tree struggles to identify minority class instances in this datasets.
+The same can be observed for precision and F1 score, which are also low in many datasets.
+
+## Modified cost-sensitive version code
+
+To address the issues observed in the standard tree, we modify the algorithm to be Cost-Sensitive.
+In standard decision trees, all misclassifications are treated equally.
+In our modified version, we assign a higher penalty (or "cost") to misclassifying the minority class.
+
+We implement this through Case Weighting:\
+1.
+*Modified Gini Index:* We adjusted the impurity calculation so that minority instances contribute more to the calculation.
+A node that includes a mix of classes will appear much "less pure" if the minority instances have more weight, making the tree try harder to separate them.\
+2.
+*Weighted Voting:* At the terminal nodes (leaves), we do not only count the number of instances, like in the standard version.
+Instead, we sum the weights., so even if the minority class has fewer instances in a leaf, if their sumed weight is higher than the majority class, it will predict the minority label.
+
+The code below implements these changes by using a weights parameter passed through the recursive splitting process.
+
+```{r}
+# Gini index with Cost-Sensitivity
+#  
+# Explanation: This function calculates "Weighted Impurity".
+# In the standard version, every row counts as "1". Here, if a row belongs to the 
+# minority class, it might count as "5" or "10" (depending on the weight).
+# 
+# Impact: This makes the algorithm "feel" that the minority class is larger than it is.
+# If a group has 100 majority items and 5 minority items (weight=20), the algorithm 
+# views this as a 50/50 split (high impurity), rather than a 95/5 split (low impurity).
+# This forces the tree to find splits that separate these "heavy" minority instances.
+gini_index_cost_sensitive <- function(groups, classes, weights) {
+  n_total_weighted <- 0
+  for(group in groups) {
+    if(nrow(group) == 0) next
+    for(r in 1:nrow(group)) {
+      lbl <- as.character(group$label[r])
+      if(!is.na(lbl) && lbl %in% names(weights)) {
+        n_total_weighted <- n_total_weighted + weights[[lbl]]
+      } else {
+        n_total_weighted <- n_total_weighted + 1
+      }
+    }
+  }
+  
+  if(n_total_weighted == 0) return(0)
+  
+  gini <- 0.0
+  
+  for (group in groups) {
+    if(nrow(group) == 0) next
+    
+    group_weight <- 0
+    for(r in 1:nrow(group)) {
+      lbl <- as.character(group$label[r])
+      if(!is.na(lbl) && lbl %in% names(weights)) {
+        group_weight <- group_weight + weights[[lbl]]
+      } else {
+        group_weight <- group_weight + 1
+      }
+    }
+    
+    if(group_weight == 0) next
+    
+    score <- 0.0
+    # Calculate WEIGHTED purity using vectorization where possible
+    for (class_val in classes) {
+      class_count <- sum(group$label == class_val, na.rm = TRUE)
+      if(class_count > 0) {
+        cw <- if(class_val %in% names(weights)) weights[[class_val]] else 1
+        # Proportion is based on WEIGHT, not just raw count
+        weighted_p <- (class_count * cw) / group_weight
+        score <- score + (weighted_p * weighted_p)
+      }
+    }
+    
+    # Weighted Gini accumulation
+    gini <- gini + (1.0 - score) * (group_weight / n_total_weighted)
+  }
+  return(gini)
+}
+
+# Split function with Cost-Sensitivity
+# 
+# This function similarly to the standard split search, but it passes the 'weights' parameter to the Gini calculation. 
+# It searches for the split that minimizes the *Weighted* Gini Index.
+# This ensures the selected cut-point is one that prioritizes isolating the high-weight (minority) instances.
+get_split_cost_sensitive <- function(dataset, weights) {
+  class_values <- unique(dataset$label)
+  n_features <- ncol(dataset) - 1
+  
+  best_split <- list(index = NULL, value = NULL, score = Inf, groups = NULL)
+  
+  for (index in 1:n_features) {
+    feature_vals <- dataset[, index]
+    
+    # Use fewer split candidates for performance
+    if (length(unique(feature_vals)) > 10) {
+      split_candidates <- quantile(feature_vals, probs = seq(0.2, 0.8, 0.2), na.rm = TRUE)
+    } else {
+      split_candidates <- unique(feature_vals)
+    }
+    
+    # Remove duplicates
+    split_candidates <- unique(split_candidates)
+    if (length(split_candidates) == 0) next
+    
+    for (value in split_candidates) {
+      groups <- test_split(index, value, dataset)
+      
+      # Skip invalid splits
+      if (nrow(groups$left) < 2 || nrow(groups$right) < 2) next
+      
+      gini <- gini_index_cost_sensitive(groups, class_values, weights)
+      
+      if (gini < best_split$score) {
+        best_split <- list(index = index, value = value, score = gini, groups = groups)
+      }
+    }
+  }
+  
+  if (is.null(best_split$index)) return(NULL)
+  return(list(index = best_split$index, value = best_split$value, groups = best_split$groups))
+}
+
+# Terminal Node with Weighted Voting
+# 
+# In a standard tree, the prediction is simply the class with the most rows (Majority Vote).
+# Here, we use Weighted Voting.
+# Example: 
+#   - 10 instances of "Majority" (Weight 1) -> Total Score: 10
+#   - 3 instances of "Minority" (Weight 5) -> Total Score: 15
+# Result: The tree predicts "Minority", even though there are fewer actual instances.
+to_terminal_cost_sensitive <- function(group, weights) {
+  if (nrow(group) == 0) return("0")
+  
+  outcomes <- as.character(group$label)
+  outcomes <- outcomes[!is.na(outcomes)]
+  
+  if(length(outcomes) == 0) return("0")
+  
+  unique_classes <- unique(outcomes)
+  class_scores <- numeric(length(unique_classes))
+  names(class_scores) <- unique_classes
+  
+  for(cls in unique_classes) {
+    count <- sum(outcomes == cls)
+    w <- if(cls %in% names(weights)) weights[[cls]] else 1
+    class_scores[cls] <- count * w
+  }
+  
+  # Return class with highest weighted score
+  names(which.max(class_scores))[1]
+}
+
+# Recursive function to propagate weights
+# 
+# This controls the tree growth. The key difference from the standard version
+# is that it passes the 'weights' object down to every child node and every
+# helper function (split calculation and terminal node selection).
+recursive_split_cost_sensitive <- function(node, max_depth, min_size, depth, weights) {
+  if (is.null(node) || depth > max_depth) return(node)
+  
+  left <- node$groups$left
+  right <- node$groups$right
+  node$groups <- NULL
+  
+  # Terminal conditions
+  if (nrow(left) == 0 || nrow(right) == 0) {
+    combined <- if (nrow(left) > 0) left else right
+    terminal_val <- to_terminal_cost_sensitive(combined, weights)
+    return(list(left = terminal_val, right = terminal_val))
+  }
+  
+  if (depth >= max_depth) {
+    node$left <- to_terminal_cost_sensitive(left, weights)
+    node$right <- to_terminal_cost_sensitive(right, weights)
+    return(node)
+  }
+  
+  # Process left child
+  if (nrow(left) <= min_size) {
+    node$left <- to_terminal_cost_sensitive(left, weights)
+  } else {
+    left_split <- get_split_cost_sensitive(left, weights)
+    node$left <- if (!is.null(left_split)) {
+      recursive_split_cost_sensitive(left_split, max_depth, min_size, depth + 1, weights)
+    } else {
+      to_terminal_cost_sensitive(left, weights)
+    }
+  }
+  
+  if (nrow(right) <= min_size) {
+    node$right <- to_terminal_cost_sensitive(right, weights)
+  } else {
+    right_split <- get_split_cost_sensitive(right, weights)
+    node$right <- if (!is.null(right_split)) {
+      recursive_split_cost_sensitive(right_split, max_depth, min_size, depth + 1, weights)
+    } else {
+      to_terminal_cost_sensitive(right, weights)
+    }
+  }
+  
+  return(node)
+}
+
+# Build cost-sensitive tree with optimized parameters
+build_tree_cost_sensitive <- function(train, max_depth = 6, min_size = 10, weights) {
+  root <- get_split_cost_sensitive(train, weights)
+  if (is.null(root)) {
+    majority_class <- to_terminal_cost_sensitive(train, weights)
+    return(list(left = majority_class, right = majority_class))
+  }
+  recursive_split_cost_sensitive(root, max_depth, min_size, 1, weights)
+}
+
+# Prediction (same as standard)
+predict_tree_cost_sensitive <- function(tree, dataset) {
+  predictions <- character(nrow(dataset))
+  for (i in 1:nrow(dataset)) {
+    predictions[i] <- predict_row_standard(tree, dataset[i, ])
+  }
+  return(predictions)
+}
+
+# Enhanced evaluation function for cost-sensitive trees with optimization
+evaluate_cost_sensitive_tree_enhanced <- function(dataset_name, dataset, minority_class_label, cost_weight) {
+  cat("Evaluating Cost-Sensitive Tree on:", dataset_name, "(Weight:", cost_weight, "x)\n")
+
+  dataset <- preprocess_dataset(dataset)
+  if (is.null(dataset)) {
+    return(NULL)
+  }
+  
+  if (!"label" %in% colnames(dataset)) {
+    return(NULL)
+  }
+  
+  if (!minority_class_label %in% dataset$label) {
+    return(NULL)
+  }
+  
+  minority_count <- sum(dataset$label == minority_class_label)
+  if (minority_count < 2) {
+    return(NULL)
+  }
+  
+  classes <- unique(dataset$label)
+  weights <- setNames(as.list(rep(1, length(classes))), classes)
+  weights[[minority_class_label]] <- cost_weight
+  
+  counts <- table(dataset$label)
+  
+  start_time <- Sys.time()
+  tree_model <- tryCatch({
+    build_tree_cost_sensitive(dataset, max_depth = 6, min_size = 10, weights = weights)
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (is.null(tree_model)) {
+    return(NULL)
+  }
+  
+  train_time <- as.numeric(Sys.time() - start_time)
+  
+  preds <- tryCatch({
+    predict_tree_cost_sensitive(tree_model, dataset)
+  }, error = function(e) {
+    majority_class <- names(which.max(table(dataset$label)))
+    return(rep(majority_class, nrow(dataset)))
+  })
+  
+  accuracy <- mean(preds == dataset$label)
+  
+  minority_indices <- which(dataset$label == minority_class_label)
+  recall <- if (length(minority_indices) > 0) {
+    correct_minority <- sum(preds[minority_indices] == minority_class_label)
+    correct_minority / length(minority_indices)
+  } else { 0 }
+  
+  predicted_minority <- which(preds == minority_class_label)
+  precision <- if (length(predicted_minority) > 0) {
+    correct_minority_pred <- sum(preds[predicted_minority] == minority_class_label)
+    correct_minority_pred / length(predicted_minority)
+  } else { 0 }
+  
+  f1_score <- if (precision + recall > 0) {
+    2 * precision * recall / (precision + recall)
+  } else { 0 }
+  
+  cat("  Results - Accuracy:", round(accuracy * 100, 2), "% | ")
+  cat("Recall:", round(recall * 100, 2), "% | ")
+  cat("Precision:", round(precision * 100, 2), "% | ")
+  cat("F1:", round(f1_score * 100, 2), "%\n")
+  
+  return(list(
+    dataset = dataset_name,
+    accuracy = accuracy,
+    recall = recall,
+    precision = precision,
+    f1_score = f1_score,
+    minority_class = minority_class_label,
+    minority_count = minority_count,
+    cost_weight = cost_weight,
+    imbalance_ratio = max(counts) / min(counts),
+    train_time = train_time
+  ))
+}
+
+# Run cost-sensitive tree evaluation on ALL datasets
+cat("\nRunning Cost-Sensitive Decision Tree Evaluation:\n\n")
+
+for (ds_id in selected_datasets) {
+  entry <- datasets[[ds_id]]
+  dataset <- entry$data
+  minority <- entry$minority
+  imb <- entry$imbalance
+  
+  # Use imbalance ratio as cost weight with ceiling
+  cost_weight <- min(round(imb, 1), 10)  # Cap at 10 to avoid extreme weights
+  
+  result <- evaluate_cost_sensitive_tree_enhanced(entry$name, dataset, minority, cost_weight)
+  if (!is.null(result)) {
+    cost_sensitive_results[[entry$name]] <- result
+  }
+}
+```
+
+## Comparing standard vs cost-sensitive results
+
+Now that we have trained both models, we need to compare them side-by-side to verify if our cost-sensitive modification actually improved the detection of the minority class.
+In this section we can see the results of that comparison in a easy to read table.
+
+```{r display_combined, fig.width=16, fig.height=12, out.width="100%"}
+create_comparison_table <- function(standard_results, cost_sensitive_results) {
+  common_datasets <- intersect(names(standard_results), names(cost_sensitive_results))
+  
+  if (length(common_datasets) == 0) return(NULL)
+  
+  comparison_df <- do.call(rbind, lapply(common_datasets, function(ds_name) {
+    std <- standard_results[[ds_name]]
+    cs <- cost_sensitive_results[[ds_name]]
+    
+    data.frame(
+      Dataset = ds_name,
+      Accuracy_Std = round(std$accuracy * 100, 2),
+      Accuracy_CS = round(cs$accuracy * 100, 2),
+      Recall_Std = round(std$recall * 100, 2),
+      Recall_CS = round(cs$recall * 100, 2),
+      F1_Std = round(std$f1_score * 100, 2),
+      F1_CS = round(cs$f1_score * 100, 2),
+      Imbalance = round(std$imbalance_ratio, 2),
+      Cost_Weight = cs$cost_weight,
+      Recall_Improvement = round((cs$recall - std$recall) * 100, 2),
+      F1_Improvement = round((cs$f1_score - std$f1_score) * 100, 2),
+      stringsAsFactors = FALSE
+    )
+  }))
+  
+  return(comparison_df)
+}
+
+if (length(standard_results) > 0 && length(cost_sensitive_results) > 0) {
+  comparison_table <- create_comparison_table(standard_results, cost_sensitive_results)
+  
+  if (!is.null(comparison_table)) {
+    cat("COMPREHENSIVE COMPARISON RESULTS:\n\n")
+    print(comparison_table)
+    
+    cat("\nSUMMARY STATISTICS:\n")
+    
+    avg_recall_std <- mean(comparison_table$Recall_Std, na.rm = TRUE)
+    avg_recall_cs <- mean(comparison_table$Recall_CS, na.rm = TRUE)
+    avg_recall_improvement <- mean(comparison_table$Recall_Improvement, na.rm = TRUE)
+    
+    avg_f1_std <- mean(comparison_table$F1_Std, na.rm = TRUE)
+    avg_f1_cs <- mean(comparison_table$F1_CS, na.rm = TRUE)
+    avg_f1_improvement <- mean(comparison_table$F1_Improvement, na.rm = TRUE)
+    
+    datasets_with_improvement <- sum(comparison_table$Recall_Improvement > 0, na.rm = TRUE)
+    total_datasets <- nrow(comparison_table)
+    
+    cat("Average Recall - Standard:    ", round(avg_recall_std, 2), "%\n")
+    cat("Average Recall - Cost-Sensitive:", round(avg_recall_cs, 2), "%\n")
+    cat("Average Recall Improvement:    +", round(avg_recall_improvement, 2), "%\n\n")
+    
+    cat("Average F1-Score - Standard:    ", round(avg_f1_std, 2), "%\n")
+    cat("Average F1-Score - Cost-Sensitive:", round(avg_f1_cs, 2), "%\n")
+    cat("Average F1-Score Improvement:    +", round(avg_f1_improvement, 2), "%\n\n")
+    
+    cat("Cost-Sensitive improved recall in", datasets_with_improvement, "out of", total_datasets, "datasets\n")
+    
+    # Recall comparison across all datasets
+    p1 <- ggplot(comparison_table, aes(x = Dataset)) +
+      geom_point(aes(y = Recall_Std, color = "Standard"), size = 3) +
+      geom_point(aes(y = Recall_CS, color = "Cost-Sensitive"), size = 3) +
+      geom_segment(aes(x = Dataset, xend = Dataset, y = Recall_Std, yend = Recall_CS), 
+                   color = "gray", alpha = 0.6) +
+      labs(title = "Recall Comparison: Standard vs Cost-Sensitive",
+           y = "Recall (%)", x = "Dataset") +
+      scale_color_manual(name = "Method", 
+                         values = c("Standard" = "lightblue", "Cost-Sensitive" = "lightcoral")) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            legend.position = "top")
+    
+    # F1-score comparison
+    p2 <- ggplot(comparison_table, aes(x = Dataset)) +
+      geom_point(aes(y = F1_Std, color = "Standard"), size = 3) +
+      geom_point(aes(y = F1_CS, color = "Cost-Sensitive"), size = 3) +
+      geom_segment(aes(x = Dataset, xend = Dataset, y = F1_Std, yend = F1_CS), 
+                   color = "gray", alpha = 0.6) +
+      labs(title = "F1-Score Comparison: Standard vs Cost-Sensitive",
+           y = "F1-Score (%)", x = "Dataset") +
+      scale_color_manual(name = "Method", 
+                         values = c("Standard" = "lightblue", "Cost-Sensitive" = "lightcoral")) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            legend.position = "top")
+    
+    # Recall improvement vs imbalance ratio
+    p3 <- ggplot(comparison_table, aes(x = Imbalance, y = Recall_Improvement)) +
+      geom_point(aes(size = abs(Recall_Improvement), color = Recall_Improvement > 0), alpha = 0.7) +
+      geom_text(aes(label = Dataset), vjust = -0.5, size = 3) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+      scale_color_manual(values = c("FALSE" = "red", "TRUE" = "blue")) +
+      labs(title = "Recall Improvement vs Dataset Imbalance",
+           x = "Imbalance Ratio", y = "Recall Improvement (%)",
+           size = "Improvement Magnitude") +
+      theme_minimal() +
+      theme(legend.position = "top")
+    
+    # Overall performance summary
+    summary_data <- data.frame(
+      Metric = rep(c("Recall", "F1-Score"), each = 2),
+      Method = rep(c("Standard", "Cost-Sensitive"), 2),
+      Value = c(avg_recall_std, avg_recall_cs, avg_f1_std, avg_f1_cs)
+    )
+    
+    p4 <- ggplot(summary_data, aes(x = Metric, y = Value, fill = Method)) +
+      geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+      labs(title = "Overall Performance Comparison",
+           y = "Score (%)", x = "Metric") +
+      scale_fill_manual(values = c("Standard" = "lightblue", "Cost-Sensitive" = "lightcoral")) +
+      theme_minimal() +
+      theme(legend.position = "top")
+    
+    ggsave("recall_comparison_plot.png", p1, width = 12, height = 8, dpi = 300)
+    ggsave("f1_comparison_plot.png", p2, width = 12, height = 8, dpi = 300)
+    ggsave("improvement_vs_imbalance_plot.png", p3, width = 10, height = 8, dpi = 300)
+    ggsave("overall_performance_plot.png", p4, width = 8, height = 6, dpi = 300)
+    combined_plot <- grid.arrange(p1, p2, p3, p4, ncol = 2, nrow = 2)
+    ggsave("combined_results_plot.png", combined_plot, width = 16, height = 12, dpi = 300)
+    invisible(combined_plot)  
+    
+    cat("\n\nEXPERIMENT COMPLETE\n\n")
+    
+    # Final conclusion
+    improvement_percentage <- (datasets_with_improvement / total_datasets) * 100
+    if (avg_recall_improvement > 0) {
+      cat("SUCCESS: Cost-sensitive decision trees improved minority class recall by", 
+          round(avg_recall_improvement, 2), "% on average.\n")
+      cat("  Improvement observed in", datasets_with_improvement, "out of", total_datasets, 
+          "datasets (", round(improvement_percentage, 1), "%)\n")
+    } else {
+      cat("RESULT: Cost-sensitive approach did not improve minority class recall on average.\n")
+      cat("  Improvement observed in", datasets_with_improvement, "out of", total_datasets, 
+          "datasets (", round(improvement_percentage, 1), "%)\n")
+    }
+    
+  } else {
+    cat("No common datasets between standard and cost-sensitive results.\n")
+  }
+} else {
+  cat("No valid results to compare. There may be issues with the datasets.\n")
+}
+```
+
+## Analysis of Results
+
+This section provides an analysis of the results obtained from comparing the standard decision tree and the cost-sensitive decision tree across multiple datasets.
+The tables provide us with all the values needed to make conclusions on what this approach brings of best or worst.
+
+By analyzing the generated visualization plots, we can draw several important conclusions about the effectiveness of the Cost-Sensitive approach:
+
+1.  Recall Comparison (Standard vs Cost-Sensitive) As seen in the Recall Comparison graph, there is a consistent and significant gap between the two methods.\
+    1.1 The *Standard Tree* (Blue dots) fluctuates a lot, with recall dropping below 40% and even 20% on more than one dataset (e.g., datasets 1053, 1050, 1068). This confirms that the standard algorithm essentially "gives up" on the minority class in difficult cases.\
+    1.2 The *Cost-Sensitive Tree* (Red dots) maintains high recall, consistently staying above 80% or 90% across almost all datasets. The vertical lines connecting the dots represent the "performance gain," which is substantial in nearly every case.
+2.  Overall Performance Comparison The aggregate results are summarized in the "Overall Performance" bar chart.\
+    2.1 *Recall*: The cost-sensitive approach (Red bar) achieves nearly double the performance of the standard approach (Blue bar). This is the most critical finding for imbalanced classification.\
+    2.2 *F1-Score*: Since F1 is the harmonic mean of Precision and Recall, the fact that the Red bar is significantly higher indicates that we improved Recall without completely destroying Precision.
+3.  Impact of Imbalance: The "Recall Improvement vs Dataset Imbalance" plot confirms our hypothesis. We can see positive improvements (blue dots above the red dashed line) for all datasets tested. This suggests the cost-sensitive method is good and works across various levels of data imbalance.
+
+## Conclusion
+
+In our cost-sensitive approach, we observed significant improvements in minority class recall across all the 14 datasets.
+This indicates that this approach was effective in solving class imbalance issues.
+The same can be observed for F1-score, which also improved in all datasets.
+
+The trade-off of this cost-sensitive approach is a decrease in the overall accuracy in most datasets, that can be explained by the fact that the model is now prioritizing minority class detection over overall correctness.
+This can be seen in the following plot:
+
+```{r display_accuracy, fig.width=16, fig.height=12, out.width="100%"}
+if (length(standard_results) > 0 && length(cost_sensitive_results) > 0) {
+  
+  plot_data <- data.frame(
+    Dataset = rep(names(standard_results), 2),
+    Method = rep(c("Standard", "Cost-Sensitive"), each = length(standard_results)),
+    Accuracy = c(
+      sapply(standard_results, function(x) round(x$accuracy * 100, 2)),
+      sapply(cost_sensitive_results[names(standard_results)], function(x) round(x$accuracy * 100, 2))
+    )
+  )
+  
+  p_accuracy <- ggplot(plot_data, aes(x = Dataset, y = Accuracy, color = Method, group = Method)) +
+    geom_line(size = 1, alpha = 0.5) +
+    geom_point(size = 3) +
+    labs(title = "Accuracy Comparison", y = "Accuracy (%)") +
+    scale_color_manual(values = c("Standard" = "blue", "Cost-Sensitive" = "red")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(hjust = 0.5))
+  ggsave("accuracy_comparison.png", p_accuracy, width = 10, height = 6, dpi = 300)
+  print(p_accuracy)  
+}
+```
+
+In the plot we have (blue line and points) the accuracy of the standard decision tree, and (red line and points) the accuracy of the cost-sensitive decision tree.
+We can see what was mentioned before: in most datasets, the accuracy of the cost-sensitive version is lower than the standard one.
+
+This proves that, even though, we were able to improve minority recall (the objective if the project) it is at the expense of the global accuracy.
+This happens because:
+
+1.  *More false positives*: By having the minority class with more weight, the model misclassified some majority instances as minority
+2.  *Accuracy paradox*: In imbalanced scenarios, the models can predict always the majority class and achieve high accuracy
+3.  *Context*: Depending on the context this trade-off might be appropriate, like in medical diagnosis, where missing a disease is very costly, the improvement in recall is worth the accuracy drop
+
+Another aspect to consider is the training time of both models, which can be observed in the plot below:
+
+```{r display_time, fig.width=16, fig.height=12, out.width="100%"}
+if (length(standard_results) > 0 && length(cost_sensitive_results) > 0) {
+  
+  plot_data <- data.frame(
+    Dataset = rep(names(standard_results), 2),
+    Method = rep(c("Standard", "Cost-Sensitive"), each = length(standard_results)),
+    Time = c(
+      sapply(standard_results, function(x) round(x$train_time, 3)),
+      sapply(cost_sensitive_results[names(standard_results)], function(x) round(x$train_time, 3))
+    )
+  )
+
+  p_time <- ggplot(plot_data, aes(x = Dataset, y = Time, color = Method, group = Method)) +
+    geom_line(size = 1, alpha = 0.5) +
+    geom_point(size = 3) +
+    labs(title = "Training Time Comparison", y = "Time (seconds)") +
+    scale_color_manual(values = c("Standard" = "blue", "Cost-Sensitive" = "red")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(hjust = 0.5))
+  ggsave("time_comparison.png", p_time, width = 10, height = 6, dpi = 300)
+  print(p_time)
+}
+```
+
+Looking at the training time plot, we can see that generally the cost-sensitive decision tree takes slightly longer to train compared to the standard decision tree.
+The time values can vary from run to run, so conclusions about timing have to be analyzed carefully.
+
+## Future work
+
+As future work, we could explore ways to use this cost-sensitive approach without losing so much accuracy.
+
+Some ideas would be:\
+1.
+Hyperparameter Tuning: Dynamically, during training, try cost weights for the minority class to find an optimal compromise, that improves recall without sacrificing so much accuracy.\
+2.
+Ensemble Methods: Combine the cost-sensitive decision tree with other models (e.g., Random Forests, Gradient Boosting) to use the best strengths of multiple algorithms.\
+3.
+Advanced Cost Functions: Explore more complicated cost functions that adjust weights based on the model's performance during t
+
+## Acknowledgements
+
+This project was developed in the scope of the IACEC class.\
+Work developed by:\
+Leonor Couto, up202205796\
+Mariana Pereira, up202205093
